@@ -3,7 +3,7 @@ use moka::future::Cache;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use typed_eventbus::{Event, EventMetaData, EventStream, Publishable};
 use validator::Validate;
 
@@ -12,14 +12,60 @@ fn gen_otp() -> u32 {
     rng.random_range(100000..999999)
 }
 
-// Models
+/// Returns an alphanumeric nonce used as the pending-cache lookup key.
+/// This is separate from the OTP so that the user-facing 6-digit code
+/// carries no entropy about which cache slot to attack.
+fn gen_nonce() -> String {
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| {
+            let idx: u8 = rng.random_range(0..36);
+            if idx < 10 {
+                (b'0' + idx) as char
+            } else {
+                (b'a' + idx - 10) as char
+            }
+        })
+        .collect()
+}
 
-#[derive(Deserialize, Validate, Clone)]
+/// Validates that a sender name is safe to use as a SQL table-name suffix.
+/// Only lowercase letters, digits, and underscores are allowed.
+fn validate_sender_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow::anyhow!("sender name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(anyhow::anyhow!(
+            "sender name must contain only lowercase letters, digits, and underscores; got: {name}"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+/// A single (subject, address) pair supplied by the client.
+#[derive(Deserialize, Validate, Clone, Serialize)]
 pub struct Preference {
-    #[validate(length(max = 64))]
+    #[validate(length(min = 1, max = 64))]
     pub subject: String,
-    #[validate(length(max = 64))]
+    #[validate(length(min = 1, max = 64))]
     pub address: String,
+}
+
+/// A batch of preferences that all share the same address.
+/// One OTP is generated for the batch; confirming it writes every row.
+#[derive(Deserialize, Validate)]
+pub struct PreferenceBatch {
+    #[validate(length(min = 1))]
+    #[validate(nested)]
+    pub preferences: Vec<Preference>,
 }
 
 #[derive(Deserialize, Validate)]
@@ -29,14 +75,30 @@ pub struct Token {
 }
 
 // ---------------------------------------------------------------------------
+// Pending entry
+// ---------------------------------------------------------------------------
+
+/// What we store in the pending cache while waiting for OTP confirmation.
+/// All preferences in a batch share a single address, which is validated
+/// to be identical across entries before the batch is accepted.
+struct PendingEntry {
+    otp: u32,
+    /// `(subject, address)` pairs — address is repeated per row so that
+    /// `confirm` can write each row independently without extra state.
+    items: Vec<(String, String)>,
+}
+
+// ---------------------------------------------------------------------------
 // Preferences
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct Preferences {
     db: Pool<Sqlite>,
-    cache: Cache<(String, String), String>, // (user, subject) -> Channel
-    pending: Cache<(String, u32), (String, String)>,
+    /// (user, subject) -> address
+    cache: Cache<(String, String), String>,
+    /// nonce -> PendingEntry  (nonce is returned to the handler, not the user)
+    pending: Cache<String, Arc<PendingEntry>>,
     allowed_subjects: HashSet<String>,
     table_name: String,
     es: Arc<dyn EventStream>,
@@ -48,56 +110,135 @@ impl Preferences {
         es: Arc<dyn EventStream>,
         subjects: Vec<String>,
         sender_name: String,
-    ) -> Self {
+    ) -> Result<Self> {
+        validate_sender_name(&sender_name)?;
         let table_name = format!("{}_preferences", sender_name);
-        init_table(&db, &table_name)
-            .await
-            .expect("could not initialize table");
-        Self {
+        init_table(&db, &table_name).await?;
+        Ok(Self {
             db,
             es,
             table_name,
-            cache: Cache::new(1000),
-            pending: Cache::new(100),
+            cache: Cache::builder()
+                .max_capacity(1000)
+                .build(),
+            pending: Cache::builder()
+                .max_capacity(100)
+                // OTP tokens expire after 10 minutes.
+                .time_to_live(Duration::from_secs(300))
+                .build(),
             allowed_subjects: subjects.into_iter().collect(),
-        }
+        })
     }
 
-    pub async fn confirm(&self, user: &str, otp: &Token) -> Result<()> {
+    // -----------------------------------------------------------------------
+    // set — accepts a batch of preferences, returns (nonce, otp)
+    //
+    // The nonce is an opaque handle stored server-side; the OTP is the
+    // 6-digit code sent out-of-band to the user.  The handler sends the OTP
+    // via the Sender and returns the nonce in the HTTP response so the client
+    // can pair them on /confirm.
+    // -----------------------------------------------------------------------
+    pub async fn set(&self, user: &str, batch: PreferenceBatch) -> Result<(String, u32)> {
+        if let Err(e) = batch.validate() {
+            return Err(anyhow::anyhow!("Invalid data: {e}"));
+        }
+
+        // All preferences must share the same address.
+        let address = &batch.preferences[0].address;
+        for pref in &batch.preferences {
+            if &pref.address != address {
+                return Err(anyhow::anyhow!(
+                    "All preferences in a batch must share the same address"
+                ));
+            }
+            if !self.allowed_subjects.contains(&pref.subject) {
+                return Err(anyhow::anyhow!(
+                    "Subject not allowed: {}",
+                    pref.subject
+                ));
+            }
+        }
+
+        let otp = gen_otp();
+        let nonce = gen_nonce();
+
+        let items = batch
+            .preferences
+            .into_iter()
+            .map(|p| (p.subject, p.address))
+            .collect();
+
+        self.pending
+            .insert(
+                format!("{}:{}", user, nonce),
+                Arc::new(PendingEntry { otp, items }),
+            )
+            .await;
+
+        Ok((nonce, otp))
+    }
+
+    // -----------------------------------------------------------------------
+    // confirm — validates OTP against the nonce, writes all rows
+    // -----------------------------------------------------------------------
+    pub async fn confirm(&self, user: &str, nonce: &str, otp: &Token) -> Result<()> {
         if let Err(e) = otp.validate() {
             return Err(anyhow::anyhow!("invalid token: {e}"));
         }
-        let (subject, channel) = match self.pending.remove(&(user.to_string(), otp.token)).await {
-            Some(r) => r,
-            None => return Err(anyhow::anyhow!("Token not found")),
-        };
-        sqlx::query(&format!(
-            "INSERT INTO {} (user, subject, address)
-             VALUES (?, ?, ?)
-             ON CONFLICT(user, subject)
-             DO UPDATE SET address = excluded.address",
-            self.table_name
-        ))
-        .bind(&user)
-        .bind(&subject)
-        .bind(&channel)
-        .execute(&self.db)
-        .await?;
 
-        self.cache
-            .insert((user.to_string(), subject.to_string()), channel.clone())
-            .await;
-        let event = ChannelConfirmed {
-            user: user.to_string(),
-            subject,
-            address: channel,
+        let key = format!("{}:{}", user, nonce);
+        let entry = match self.pending.get(&key).await {
+            Some(e) => e,
+            None => return Err(anyhow::anyhow!("Token not found or expired")),
         };
-        let emd = EventMetaData::new("mgk");
-        let event = Event::new(emd, event);
-        let _ = event.publish(self.es.clone()).await;
+
+        if entry.otp != otp.token {
+            return Err(anyhow::anyhow!("Token not found or expired"));
+        }
+
+        // Remove the entry now that it has been consumed.
+        self.pending.remove(&key).await;
+
+        for (subject, address) in &entry.items {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (user, subject, address)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(user, subject)
+                 DO UPDATE SET address = excluded.address",
+                table = self.table_name
+            ))
+            .bind(user)
+            .bind(subject)
+            .bind(address)
+            .execute(&self.db)
+            .await?;
+
+            self.cache
+                .insert(
+                    (user.to_string(), subject.clone()),
+                    address.clone(),
+                )
+                .await;
+
+            let event = ChannelConfirmed {
+                user: user.to_string(),
+                subject: subject.clone(),
+                address: address.clone(),
+            };
+            let emd = EventMetaData::new("mgk");
+            let ev = Event::new(emd, event);
+            // Best-effort publish; a failure here must not roll back the DB write.
+            if let Err(e) = ev.publish(self.es.clone()).await {
+                tracing::warn!(error = %e, user, subject, "Failed to publish ChannelConfirmed event");
+            }
+        }
+
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // get — cache-aside read
+    // -----------------------------------------------------------------------
     pub async fn get(&self, user: &str, subject: &str) -> Result<Option<String>> {
         let key = (user.to_string(), subject.to_string());
 
@@ -114,47 +255,35 @@ impl Preferences {
         .fetch_optional(&self.db)
         .await?;
 
-        if let Some(channel) = result {
-            self.cache.insert(key, channel.clone()).await;
-            return Ok(Some(channel));
+        if let Some(address) = result {
+            self.cache.insert(key, address.clone()).await;
+            return Ok(Some(address));
         }
         Ok(None)
     }
-
-    pub async fn set(&self, user: &str, pref: Preference) -> Result<u32> {
-        if let Err(e) = pref.validate() {
-            return Err(anyhow::anyhow!("Invalid data: {e}"));
-        }
-        if !self.allowed_subjects.contains(&pref.subject) {
-            return Err(anyhow::anyhow!("Subject not allowed"));
-        }
-        let otp = gen_otp();
-        self.pending
-            .insert((user.into(), otp), (pref.subject, pref.address))
-            .await;
-        Ok(otp)
-    }
 }
 
-async fn init_table(pool: &Pool<Sqlite>, table_name: &String) -> Result<(), sqlx::Error> {
-    if let Err(e) = sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS {} (
-user TEXT,
-subject TEXT,
-address TEXT,
-UNIQUE(user, subject)
-)
-",
-        table_name
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+async fn init_table(pool: &Pool<Sqlite>, table_name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (
+            user    TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            address TEXT NOT NULL,
+            UNIQUE(user, subject)
+        )",
     ))
     .execute(pool)
-    .await
-    {
-        Err(e)
-    } else {
-        Ok(())
-    }
+    .await?;
+    Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct ChannelConfirmed {

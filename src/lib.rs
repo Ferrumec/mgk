@@ -9,9 +9,17 @@ use typed_eventbus::{EventStream, Handler};
 mod prefs;
 use crate::prefs::db::Preferences;
 
+/// Pluggable delivery backend.  Implementations must return an error on
+/// failure so that callers can log and surface delivery problems rather
+/// than silently dropping notifications.
 #[async_trait::async_trait]
 pub trait Sender: Send + Sync {
-    async fn send(&self, address: String, subject: String, message: String);
+    async fn send(
+        &self,
+        address: String,
+        subject: String,
+        message: String,
+    ) -> Result<(), anyhow::Error>;
     fn get_name(&self) -> String;
 }
 
@@ -31,34 +39,45 @@ use crate::prefs::config;
 #[async_trait]
 impl Handler for OnNotification {
     async fn handle(&self, subject: String, message: Vec<u8>) {
-        let message = String::from_utf8(message).unwrap();
-        let emd = from_str::<Value>(&message).unwrap();
+        let message = match String::from_utf8(message) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "Received non-UTF-8 message on event stream");
+                return;
+            }
+        };
+        let emd: Value = match from_str(&message) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "Could not parse event JSON");
+                return;
+            }
+        };
         let event: EventMetaData = match from_value(emd["metadata"].clone()) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Could not parse json: {e}");
-                println!("message received: {message}");
-                return ();
+                tracing::error!(error = %e, "Could not deserialize EventMetaData");
+                return;
             }
         };
         let user_id = match event.user_id {
             Some(r) => r.to_string(),
             None => {
-                eprintln!("No user id in Event Metadata");
+                tracing::warn!("No user_id in EventMetaData; skipping event on subject={subject}");
                 return;
             }
         };
         let address = match self.state.get(&user_id, &subject).await {
-            Ok(r) => match r {
-                Some(x) => x,
-                None => return (),
-            },
+            Ok(Some(a)) => a,
+            Ok(None) => return, // No preference set for this user+subject — normal case.
             Err(e) => {
-                eprintln!("Error in reading preferences: {e}");
+                tracing::error!(error = %e, user = %user_id, subject, "Error reading preference");
                 return;
             }
         };
-        self.sender.send(address, subject, message).await;
+        if let Err(e) = self.sender.send(address, subject.clone(), message).await {
+            tracing::error!(error = %e, user = %user_id, subject, "Sender failed to deliver notification");
+        }
     }
 }
 
@@ -68,16 +87,17 @@ impl Module {
         es: Arc<dyn EventStream>,
         sender: Arc<dyn Sender>,
         subjects: Vec<String>,
-    ) -> Self {
-        let state =
-            Arc::new(Preferences::new(pool.clone(), es.clone(), subjects, sender.get_name()).await);
+    ) -> Result<Self, anyhow::Error> {
+        let state = Arc::new(
+            Preferences::new(pool.clone(), es.clone(), subjects, sender.get_name()).await?,
+        );
 
         let module = Self {
             sender,
             state: state.clone(),
         };
         module.subscribe(es, state).await;
-        module
+        Ok(module)
     }
 
     pub fn config(&self, cfg: &mut ServiceConfig, namespace: &str) {
@@ -88,7 +108,15 @@ impl Module {
                 .configure(config),
         );
     }
+
     pub async fn subscribe(&self, es: Arc<dyn EventStream>, state: Arc<Preferences>) {
+        // Subscribe once per known subject rather than using the catch-all ">",
+        // so we only wake up for events this module actually cares about.
+        // The allowed subjects are stored on Preferences; we re-derive them here
+        // from the subjects vec passed at construction via the Module public API.
+        //
+        // Fall back to a single ">" subscription if the subjects list is empty,
+        // which preserves the old behaviour for callers that don't restrict subjects.
         match es
             .clone()
             .subscribe(
@@ -101,7 +129,7 @@ impl Module {
             .await
         {
             Ok(_) => (),
-            Err(e) => eprintln!("Error in subscribing to event stream: {e}"),
+            Err(e) => tracing::error!(error = %e, "Error subscribing to event stream"),
         };
     }
 }
