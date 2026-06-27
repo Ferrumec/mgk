@@ -1,0 +1,19 @@
+[package]
+name = "mgk"
+description = "Messaging Gate Keeper, A pluggable channel framework for notification services"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4.13.0"
+serde_json = "1.0.149"
+async-trait = "0.1.89"
+sqlx = { version = "0.8.6", features = ["sqlite"] }
+tracing = "0.1.44"
+serde = "1.0.228"
+moka = { version = "0.12.15", features = ["future"] }
+anyhow = "1.0.102"
+actixutils = { git = "https://github.com/Austin-rgb/actixutils" }
+typed-eventbus = { git = "https://github.com/Austin-rgb/event-stream" }
+validator = { version = "0.20.0", features = ["derive"] }
+rand = "0.10.1"
