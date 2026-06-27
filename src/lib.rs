@@ -1,11 +1,11 @@
 use actix_web::web;
 use actix_web::web::ServiceConfig;
 use async_trait::async_trait;
-use typed_eventbus::EventMetaData;
-use typed_eventbus::{EventStream, Handler};
 use serde_json::{Value, from_str, from_value};
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
+use typed_eventbus::EventMetaData;
+use typed_eventbus::{EventStream, Handler};
 mod prefs;
 use crate::prefs::db::Preferences;
 
@@ -69,7 +69,8 @@ impl Module {
         sender: Arc<dyn Sender>,
         subjects: Vec<String>,
     ) -> Self {
-        let state = Arc::new(Preferences::new(pool.clone(), es.clone(), subjects, sender.get_name()).await);
+        let state =
+            Arc::new(Preferences::new(pool.clone(), es.clone(), subjects, sender.get_name()).await);
 
         let module = Self {
             sender,

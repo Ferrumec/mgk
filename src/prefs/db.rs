@@ -1,10 +1,10 @@
 use anyhow::Result;
-use typed_eventbus::{Event, EventMetaData, EventStream, Publishable};
 use moka::future::Cache;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::{collections::HashSet, sync::Arc};
+use typed_eventbus::{Event, EventMetaData, EventStream, Publishable};
 use validator::Validate;
 
 fn gen_otp() -> u32 {
@@ -94,7 +94,7 @@ impl Preferences {
         };
         let emd = EventMetaData::new("mgk");
         let event = Event::new(emd, event);
-       let _ =  event.publish(self.es.clone()).await;
+        let _ = event.publish(self.es.clone()).await;
         Ok(())
     }
 
