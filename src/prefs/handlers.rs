@@ -54,7 +54,11 @@ pub async fn set_preference(
             // response is still 200 because the pending entry was recorded
             // and the user may retry via /confirm within the TTL window.
             let result = sender
-                .send(address.clone(), "confirm address".to_owned(), otp.to_string())
+                .send(
+                    address.clone(),
+                    "confirm address".to_owned(),
+                    otp.to_string(),
+                )
                 .await;
             if let Err(e) = result {
                 error!(
@@ -84,7 +88,10 @@ pub async fn confirm_preference(
 ) -> impl Responder {
     let body = body.into_inner();
     let token = Token { token: body.token };
-    match state.confirm(&id.sub.to_string(), &body.nonce, &token).await {
+    match state
+        .confirm(&id.sub.to_string(), &body.nonce, &token)
+        .await
+    {
         Ok(_) => HttpResponse::Ok().finish(),
         Err(e) => {
             error!(

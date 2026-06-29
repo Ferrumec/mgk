@@ -4,7 +4,7 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
 use std::{collections::HashSet, sync::Arc, time::Duration};
-use typed_eventbus::{Event, EventMetaData, EventStream, Publishable};
+use typed_eventbus::{Event, EventStream, Publishable};
 use validator::Validate;
 
 fn gen_otp() -> u32 {
@@ -118,9 +118,7 @@ impl Preferences {
             db,
             es,
             table_name,
-            cache: Cache::builder()
-                .max_capacity(1000)
-                .build(),
+            cache: Cache::builder().max_capacity(1000).build(),
             pending: Cache::builder()
                 .max_capacity(100)
                 // OTP tokens expire after 10 minutes.
@@ -152,10 +150,7 @@ impl Preferences {
                 ));
             }
             if !self.allowed_subjects.contains(&pref.subject) {
-                return Err(anyhow::anyhow!(
-                    "Subject not allowed: {}",
-                    pref.subject
-                ));
+                return Err(anyhow::anyhow!("Subject not allowed: {}", pref.subject));
             }
         }
 
@@ -214,10 +209,7 @@ impl Preferences {
             .await?;
 
             self.cache
-                .insert(
-                    (user.to_string(), subject.clone()),
-                    address.clone(),
-                )
+                .insert((user.to_string(), subject.clone()), address.clone())
                 .await;
 
             let event = ChannelConfirmed {
@@ -225,8 +217,8 @@ impl Preferences {
                 subject: subject.clone(),
                 address: address.clone(),
             };
-            let emd = EventMetaData::new("mgk");
-            let ev = Event::new(emd, event);
+            
+            let ev = Event::new(event).with_producer("mgk");
             // Best-effort publish; a failure here must not roll back the DB write.
             if let Err(e) = ev.publish(self.es.clone()).await {
                 tracing::warn!(error = %e, user, subject, "Failed to publish ChannelConfirmed event");

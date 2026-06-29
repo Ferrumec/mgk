@@ -17,3 +17,4 @@ actixutils = { git = "https://github.com/Austin-rgb/actixutils" }
 typed-eventbus = { git = "https://github.com/Austin-rgb/event-stream" }
 validator = { version = "0.20.0", features = ["derive"] }
 rand = "0.10.1"
+uuid = "1.23.4"
