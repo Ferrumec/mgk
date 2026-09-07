@@ -214,7 +214,7 @@ impl Preferences {
 
             let event = ChannelConfirmed {
                 user: user.to_string(),
-                subject: subject.clone(),
+                channel: self.table_name.replace("_preferences", ""),
                 address: address.clone(),
             };
             
@@ -280,7 +280,7 @@ async fn init_table(pool: &Pool<Sqlite>, table_name: &str) -> Result<(), sqlx::E
 #[derive(Serialize)]
 struct ChannelConfirmed {
     user: String,
-    subject: String,
+    channel: String,
     address: String,
 }
 
