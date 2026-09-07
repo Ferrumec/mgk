@@ -2,13 +2,33 @@ use actix_web::web;
 use actix_web::web::ServiceConfig;
 use async_trait::async_trait;
 use serde_json::{Value, from_str, from_value};
-use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use uuid::Uuid;
 use typed_eventbus::EventMetaData;
 use typed_eventbus::{EventStream, Handler, Identifier};
+use uuid::Uuid;
 mod prefs;
 use crate::prefs::db::Preferences;
+use viewset::{Entity, Repository};
+
+pub struct CreatePreference {
+    user: String,
+    subject: String,
+    address: String,
+}
+
+pub trait GetAddress {
+    fn get_address(&self) -> String;
+}
+
+impl CreatePreference {
+    pub fn new(user: String, subject: String, address: String) -> Self {
+        Self {
+            user,
+            subject,
+            address,
+        }
+    }
+}
 
 /// Pluggable delivery backend.  Implementations must return an error on
 /// failure so that callers can log and surface delivery problems rather
@@ -30,14 +50,14 @@ pub trait IdResolver: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct Module {
+pub struct Module<Repo: Repository> {
     sender: Arc<dyn Sender>,
-    state: Arc<Preferences>,
+    state: Arc<Preferences<Repo>>,
     id_resolver: Arc<dyn IdResolver>,
 }
 
-struct OnNotification {
-    state: Arc<Preferences>,
+struct OnNotification<Repo: Repository> {
+    state: Arc<Preferences<Repo>>,
     sender: Arc<dyn Sender>,
     id_resolver: Arc<dyn IdResolver>,
 }
@@ -45,7 +65,11 @@ struct OnNotification {
 use crate::prefs::config;
 
 #[async_trait]
-impl Handler for OnNotification {
+impl<Repo: Repository + 'static> Handler for OnNotification<Repo>
+where
+    <<Repo as Repository>::Entity as Entity>::CreateDto: From<CreatePreference>,
+    <Repo as Repository>::Entity: GetAddress,
+{
     async fn handle(&self, subject: String, message: Vec<u8>) {
         let message = match String::from_utf8(message) {
             Ok(s) => s,
@@ -72,9 +96,7 @@ impl Handler for OnNotification {
             let user_id = match self.id_resolver.resolve(id).await {
                 Ok(r) => r.to_string(),
                 Err(e) => {
-                    tracing::error!(
-                        "invalid identifier: {e}; skipping event on subject={subject}"
-                    );
+                    tracing::error!("invalid identifier: {e}; skipping event on subject={subject}");
                     return;
                 }
             };
@@ -86,24 +108,31 @@ impl Handler for OnNotification {
                     return;
                 }
             };
-            if let Err(e) = self.sender.send(address, subject.clone(), message.clone()).await {
+            if let Err(e) = self
+                .sender
+                .send(address, subject.clone(), message.clone())
+                .await
+            {
                 tracing::error!(error = %e, user = %user_id, subject, "Sender failed to deliver notification");
             }
         }
     }
 }
 
-impl Module {
+impl<Repo: Repository + 'static> Module<Repo>
+where
+    <<Repo as Repository>::Entity as Entity>::CreateDto: From<CreatePreference>,
+    <Repo as Repository>::Entity: GetAddress,
+{
     pub async fn new(
-        pool: Pool<Sqlite>,
+        pool: Arc<Repo>,
         es: Arc<dyn EventStream>,
         sender: Arc<dyn Sender>,
-    id_resolver: Arc<dyn IdResolver>,
+        id_resolver: Arc<dyn IdResolver>,
         subjects: Vec<String>,
-    
     ) -> Result<Self, anyhow::Error> {
         let state = Arc::new(
-            Preferences::new(pool.clone(), es.clone(), subjects, sender.get_name()).await?,
+            Preferences::new(pool.clone(), es.clone(), subjects,).await?,
         );
 
         let module = Self {
@@ -120,11 +149,11 @@ impl Module {
             web::scope(namespace)
                 .app_data(web::Data::from(self.state.clone()))
                 .app_data(web::Data::new(self.sender.clone()))
-                .configure(config),
+                .configure(config::<Repo>),
         );
     }
 
-    pub async fn subscribe(&self, es: Arc<dyn EventStream>, state: Arc<Preferences>) {
+    pub async fn subscribe(&self, es: Arc<dyn EventStream>, state: Arc<Preferences<Repo>>) {
         // Subscribe once per known subject rather than using the catch-all ">",
         // so we only wake up for events this module actually cares about.
         // The allowed subjects are stored on Preferences; we re-derive them here

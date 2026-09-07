@@ -18,3 +18,4 @@ typed-eventbus = "0.2.1"
 validator = { version = "0.20.0", features = ["derive"] }
 rand = "0.10.1"
 uuid = "1.23.4"
+viewset = "0.4"

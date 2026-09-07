@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
+use super::db::Preferences;
 use crate::Sender;
 use crate::prefs::db::{PreferenceBatch, Token};
-
-use super::db::Preferences;
+use crate::{CreatePreference, GetAddress};
 use actix_web::web;
 use actix_web::{HttpResponse, Responder};
 use actixutils::{Auth, Identity};
 use serde::{Deserialize, Serialize};
 use tracing::error;
+use viewset::{Entity, Repository};
 
 // ---------------------------------------------------------------------------
 // Preferences
@@ -33,12 +34,16 @@ pub struct ConfirmBody {
     pub token: u32,
 }
 
-pub async fn set_preference(
+pub async fn set_preference<Repo: Repository>(
     Auth(id): Auth<Identity>,
-    state: web::Data<Preferences>,
+    state: web::Data<Preferences<Repo>>,
     sender: web::Data<Arc<dyn Sender>>,
     body: web::Json<PreferenceBatch>,
-) -> impl Responder {
+) -> impl Responder
+where
+    <<Repo as Repository>::Entity as Entity>::CreateDto: From<CreatePreference>,
+    <Repo as Repository>::Entity: GetAddress,
+{
     let batch = body.into_inner();
 
     // Capture the address before we move the batch into `set`.
@@ -81,11 +86,15 @@ pub async fn set_preference(
     }
 }
 
-pub async fn confirm_preference(
+pub async fn confirm_preference<Repo: Repository>(
     Auth(id): Auth<Identity>,
-    state: web::Data<Preferences>,
+    state: web::Data<Preferences<Repo>>,
     body: web::Json<ConfirmBody>,
-) -> impl Responder {
+) -> impl Responder
+where
+    <<Repo as Repository>::Entity as Entity>::CreateDto: From<CreatePreference>,
+    <Repo as Repository>::Entity: GetAddress,
+{
     let body = body.into_inner();
     let token = Token { token: body.token };
     match state
@@ -104,11 +113,15 @@ pub async fn confirm_preference(
     }
 }
 
-pub async fn get_preference(
+pub async fn get_preference<Repo: Repository>(
     Auth(id): Auth<Identity>,
-    state: web::Data<Preferences>,
+    state: web::Data<Preferences<Repo>>,
     query: web::Query<PreferenceGetQuery>,
-) -> impl Responder {
+) -> impl Responder
+where
+    <<Repo as Repository>::Entity as Entity>::CreateDto: From<CreatePreference>,
+    <Repo as Repository>::Entity: GetAddress,
+{
     match state.get(&id.sub.to_string(), &query.subject).await {
         Ok(Some(channel)) => HttpResponse::Ok().json(channel),
         Ok(None) => HttpResponse::NotFound().finish(),

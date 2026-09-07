@@ -1,11 +1,13 @@
+use crate::{CreatePreference, GetAddress};
 use anyhow::Result;
 use moka::future::Cache;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
+use std::collections::HashMap;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use typed_eventbus::{Event, EventStream, Publishable};
 use validator::Validate;
+use viewset::{Entity, Repository};
 
 fn gen_otp() -> u32 {
     let mut rng = rand::rng();
@@ -29,22 +31,6 @@ fn gen_nonce() -> String {
         .collect()
 }
 
-/// Validates that a sender name is safe to use as a SQL table-name suffix.
-/// Only lowercase letters, digits, and underscores are allowed.
-fn validate_sender_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(anyhow::anyhow!("sender name must not be empty"));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        return Err(anyhow::anyhow!(
-            "sender name must contain only lowercase letters, digits, and underscores; got: {name}"
-        ));
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Models
@@ -93,8 +79,8 @@ struct PendingEntry {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct Preferences {
-    db: Pool<Sqlite>,
+pub struct Preferences<Repo: Repository> {
+    db: Arc<Repo>,
     /// (user, subject) -> address
     cache: Cache<(String, String), String>,
     /// nonce -> PendingEntry  (nonce is returned to the handler, not the user)
@@ -104,17 +90,18 @@ pub struct Preferences {
     es: Arc<dyn EventStream>,
 }
 
-impl Preferences {
+impl<Repo: Repository> Preferences<Repo>
+where
+    <<Repo as Repository>::Entity as Entity>::CreateDto: From<CreatePreference>,
+    <Repo as Repository>::Entity: GetAddress,
+{
     pub async fn new(
-        db: Pool<Sqlite>,
+        db: Arc<Repo>,
         es: Arc<dyn EventStream>,
         subjects: Vec<String>,
-        sender_name: String,
     ) -> Result<Self> {
-        validate_sender_name(&sender_name)?;
-        let table_name = format!("{}_preferences", sender_name);
-        init_table(&db, &table_name).await?;
-        Ok(Self {
+        let table_name = format!("{}_preferences", <<Repo as Repository>::Entity as Entity>::TABLE);
+          Ok(Self {
             db,
             es,
             table_name,
@@ -195,18 +182,9 @@ impl Preferences {
         self.pending.remove(&key).await;
 
         for (subject, address) in &entry.items {
-            sqlx::query(&format!(
-                "INSERT INTO {table} (user, subject, address)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(user, subject)
-                 DO UPDATE SET address = excluded.address",
-                table = self.table_name
-            ))
-            .bind(user)
-            .bind(subject)
-            .bind(address)
-            .execute(&self.db)
-            .await?;
+           
+            let pref = CreatePreference::new(user.into(), subject.into(), address.into());
+            self.db.create(pref.into()).await?;
 
             self.cache
                 .insert((user.to_string(), subject.clone()), address.clone())
@@ -217,7 +195,7 @@ impl Preferences {
                 channel: self.table_name.replace("_preferences", ""),
                 address: address.clone(),
             };
-            
+
             let ev = Event::new(event).with_producer("mgk");
             // Best-effort publish; a failure here must not roll back the DB write.
             if let Err(e) = ev.publish(self.es.clone()).await {
@@ -238,16 +216,21 @@ impl Preferences {
             return Ok(Some(cached));
         }
 
-        let result = sqlx::query_scalar::<_, String>(&format!(
+        /*let result = sqlx::query_scalar::<_, String>(&format!(
             "SELECT address FROM {} WHERE user = ? AND subject = ?",
             self.table_name
         ))
         .bind(user)
         .bind(subject)
-        .fetch_optional(&self.db)
-        .await?;
-
-        if let Some(address) = result {
+        .fetch_optional(&self.db)*/
+        let filters: HashMap<&str, String> =
+            vec![("user", user.to_string()), ("subject", subject.to_string())]
+                .into_iter()
+                .collect();
+        let result = self.db.list(&filters.into()).await?;
+        let (addresses, _count) = result;
+        if addresses.len() > 0 {
+            let address = addresses[0].get_address();
             self.cache.insert(key, address.clone()).await;
             return Ok(Some(address));
         }
@@ -255,23 +238,6 @@ impl Preferences {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
-
-async fn init_table(pool: &Pool<Sqlite>, table_name: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!(
-        "CREATE TABLE IF NOT EXISTS {table_name} (
-            user    TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            address TEXT NOT NULL,
-            UNIQUE(user, subject)
-        )",
-    ))
-    .execute(pool)
-    .await?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Events
